@@ -2,4 +2,4 @@
 .vscode
 *.zip
 *.pth
-models/
+*.trtmodel
