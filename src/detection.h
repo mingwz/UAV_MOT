@@ -117,6 +117,11 @@ private:
 	int output_size[5];
 	float *output_data[5];
 	std::string output_names[5] = { "hm", "wh","reg","hm_pool", "id" };
+	
+	int inputIndex = 0;
+	int input_size = 1;
+	void*buffers[output_tensor_num + 1];
+	cudaStream_t stream;
 
 	nvinfer1::IRuntime* runtime_;
 	nvinfer1::ICudaEngine* engine_;
@@ -139,7 +144,7 @@ public:
 		case DetectorMethod::FromFile:
 			return new FileDetector(config.fd);
 		case DetectorMethod::FromFairMOT:
-			return new FairMOTDetector(config.fairmot);
+			return new FairMOTDetector(config.fairmot); // 构造函数
 			
 		}
 	}

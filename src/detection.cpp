@@ -215,6 +215,15 @@ FairMOTDetector::~FairMOTDetector()
 		delete[] output_data[i];
 		output_data[i] = NULL;
 	}
+
+	// Release stream and buffers
+	cudaStreamDestroy(stream);
+	CHECK(cudaFree(buffers[inputIndex]));
+	for (int i = 0; i < output_tensor_num; i++)
+	{
+		CHECK(cudaFree(buffers[output_idx[i]]));
+	}
+
 	context_->destroy();
 	engine_->destroy();
 	runtime_->destroy();
@@ -306,7 +315,8 @@ bool FairMOTDetector::init()
 		}
 	}
 
-	char*trtModelStream; int size;
+	char*trtModelStream; 
+	int size;
 	std::ifstream file(engine_model_name, std::ios::binary);
 	if (file.good())
 	{
@@ -345,6 +355,22 @@ bool FairMOTDetector::init()
 		output_data[i] = new float[size];
 		output_size[i] = size;
 	}
+	
+	// 分配输入显存空间
+	for (int j = 0; j < input_dims.nbDims; j++)
+	{
+		input_size *= input_dims.d[j];
+	}
+	CHECK(cudaMalloc(&buffers[input_index], input_size * sizeof(float)));
+	
+	// 分配输出显存空间
+	for (int i = 0; i < output_tensor_num; i++)
+	{
+		CHECK(cudaMalloc(&buffers[output_idx[i]], output_size[i] * sizeof(float)));
+	}
+	// Create stream
+	CHECK(cudaStreamCreate(&stream));
+
 	return true;
 }
 
@@ -364,7 +390,6 @@ cv::Rect FairMOTDetector::restoreCenterNetBox(float dx, float dy, float l, float
 }
 
 
-
 void FairMOTDetector::get_detection(cv::Mat& frame, std::vector<DetectionBox>& vec_db, std::vector<cv::Mat>& vec_features)
 {
 	vec_db.clear();
@@ -377,32 +402,16 @@ void FairMOTDetector::get_detection(cv::Mat& frame, std::vector<DetectionBox>& v
 	std::vector<cv::Mat> ms(frame.channels());
 
 	float ratio = float(input_w) / float(frame_width) < float(input_h) / float(frame_height) ? float(input_w) / float(frame_width) : float(input_h) / float(frame_height);
-	cv::Mat flt_img = cv::Mat::zeros(cv::Size(input_w, input_h), CV_8UC3);
+	cv::Mat flt_img = cv::Mat::zeros(cv::Size(input_w, input_h), CV_8UC3); // 0初始化一个数组
 	cv::Mat rsz_img;
 	cv::resize(frame, rsz_img, cv::Size(), ratio, ratio);
-	rsz_img.copyTo(flt_img(cv::Rect(0, 0, rsz_img.cols, rsz_img.rows)));
+	rsz_img.copyTo(flt_img(cv::Rect(0, 0, rsz_img.cols, rsz_img.rows))); // 复制到对应区域，其余为原值
 	flt_img.convertTo(flt_img, CV_32FC3, 1.0 / 255);
 	for (int i = 0; i < ms.size(); ++i)
 		ms[i] = cv::Mat(input_h, input_w, CV_32F, &data_[i*input_h * input_w]);
 	cv::split(flt_img, ms);
-	const nvinfer1::ICudaEngine& engine = context_->getEngine();
-	void*buffers[output_tensor_num + 1];
-	int inputIndex = 0;
-	auto input_dims = engine.getBindingDimensions(inputIndex);
-	int input_size = 1;
-	for (int j = 0; j < input_dims.nbDims; j++)
-	{
-		input_size *= input_dims.d[j];
-	}
-	CHECK(cudaMalloc(&buffers[inputIndex], input_size * sizeof(float)));
-
-	for (int i = 0; i < output_tensor_num; i++)
-	{
-		CHECK(cudaMalloc(&buffers[output_idx[i]], output_size[i] * sizeof(float)));
-	}
-	// Create stream
-	cudaStream_t stream;
-	CHECK(cudaStreamCreate(&stream));
+	
+	const nvinfer1::ICudaEngine& engine2 = context_->getEngine();
 
 	// DMA input batch data to device, infer on the batch asynchronously, and DMA output back to host
 	CHECK(cudaMemcpyAsync(buffers[inputIndex], data_, input_size * sizeof(float), cudaMemcpyHostToDevice, stream));
@@ -413,14 +422,6 @@ void FairMOTDetector::get_detection(cv::Mat& frame, std::vector<DetectionBox>& v
 	}
 	cudaStreamSynchronize(stream);
 
-	// Release stream and buffers
-	cudaStreamDestroy(stream);
-	CHECK(cudaFree(buffers[inputIndex]));
-	for (int i = 0; i < output_tensor_num; i++)
-	{
-		CHECK(cudaFree(buffers[output_idx[i]]));
-	}
-
 	float *hm_ptr = output_data[0];
 	float *wh_ptr = output_data[1];
 	float *reg_ptr = output_data[2];
@@ -429,10 +430,10 @@ void FairMOTDetector::get_detection(cv::Mat& frame, std::vector<DetectionBox>& v
 	int size = output_size[0];
 	int x, y;
 	int down_ratio = 4;
-	int hm_width = engine.getBindingDimensions(output_idx[0]).d[3]; // 272
-	int hm_height = engine.getBindingDimensions(output_idx[0]).d[2]; // 152
+	int hm_width = engine2.getBindingDimensions(output_idx[0]).d[3]; // 272
+	int hm_height = engine2.getBindingDimensions(output_idx[0]).d[2]; // 152
 	int id_dims[4];
-	for (int i = 0; i < 4; i++) id_dims[i] = engine.getBindingDimensions(output_idx[4]).d[i];
+	for (int i = 0; i < 4; i++) id_dims[i] = engine2.getBindingDimensions(output_idx[4]).d[i];
 	std::vector<cv::RotatedRect> vec_rrect;
 	std::vector<float> vec_score;
 	ratio = 1.0f / ratio;
@@ -445,13 +446,25 @@ void FairMOTDetector::get_detection(cv::Mat& frame, std::vector<DetectionBox>& v
 			x = idx % hm_width;
 			y = idx / hm_width;
 			
-			// 排列顺序 1x4x152x272 -> 1x152x272x4
-			float dx = *(reg_ptr + idx);
-			float dy = *(reg_ptr + outsize + idx);
-			float l = *(wh_ptr + idx);
-			float t = *(wh_ptr + outsize + idx);
-			float r = *(wh_ptr + outsize * 2 + idx);
-			float b = *(wh_ptr + outsize * 3 + idx);
+			// reg without permute(0, 2, 3, 1)
+			// float dx = *(reg_ptr + idx);
+			// float dy = *(reg_ptr + outsize + idx);
+
+			// reg with permute(0, 2, 3, 1)
+			float dx = *(reg_ptr + idx * 2);
+			float dy = *(reg_ptr + idx * 2 + 1);
+
+			// wh without permute(0, 2, 3, 1)
+			// float l = *(wh_ptr + idx);
+			// float t = *(wh_ptr + outsize + idx);
+			// float r = *(wh_ptr + outsize * 2 + idx);
+			// float b = *(wh_ptr + outsize * 3 + idx);
+
+			// wh、reg with permute(0, 2, 3, 1)  排列顺序 1x4x152x272 -> 1x152x272x4
+			float l = *(wh_ptr + idx * 4);
+			float t = *(wh_ptr + idx * 4 + 1);
+			float r = *(wh_ptr + idx * 4 + 2);
+			float b = *(wh_ptr + idx * 4 + 3);
 
 			cv::Rect box = restoreCenterNetBox(dx, dy, l, t, r, b, x, y, down_ratio, cv::Size(input_w, input_h), frame.size());
 			box = box & cv::Rect(0, 0, frame.cols, frame.rows);
